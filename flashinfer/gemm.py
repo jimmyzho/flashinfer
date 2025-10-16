@@ -349,7 +349,7 @@ def get_gemm_sm100_module_cutlass_fp8():
         cutlass_fp8_gemm_runner=cutlass_fp8_gemm_runner,
     )
 
-
+# This is just helper for bmm_fp8
 def fp8_gemm_sm100(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -380,10 +380,6 @@ def fp8_gemm_sm100(
         runners.append(get_gemm_module().cublas_fp8_gemm_runner())
     if CUDNN_AVAILABLE and "cudnn" in runner_names:
         runners.append(_cudnn_gemm_fp8_runner())
-
-    if len(runners) == 0:
-        major, minor = get_compute_capability(torch.device("cuda"))
-        raise ValueError(f"No valid runner found for current device sm{major}{minor}")
 
     tuner = AutoTuner.get()
     a_tensor_index = 0
@@ -2008,7 +2004,69 @@ def mm_fp4(
         )
     return out
 
+def _check_bmm_fp8_problem_size(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    dtype: torch.dtype,
+    out: Optional[torch.Tensor] = None,
+    backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
+):
+    _validate_fp8_output_dtype(dtype)
+    return True
 
+@supported_compute_capability([89, 90, 100, 103, 120])
+def _cudnn_bmm_fp8_requirement(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    dtype: torch.dtype,
+    out: Optional[torch.Tensor] = None,
+    backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
+):
+    _check_cudnn_availability()
+    return True
+
+
+@supported_compute_capability([89, 90, 100, 103, 120])
+def _cublas_bmm_fp8_requirement(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    dtype: torch.dtype,
+    out: Optional[torch.Tensor] = None,
+    backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
+):
+    return True
+
+
+@supported_compute_capability([100, 103, 110, 120, 121])
+def _cutlass_bmm_fp8_requirement(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    dtype: torch.dtype,
+    out: Optional[torch.Tensor] = None,
+    backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
+):
+    if A.dtype == torch.float8_e5m2 or B.dtype == torch.float8_e5m2:
+        raise ValueError("e5m2 is not supported for bmm_fp8 with cutlass backend")
+    return True
+
+
+@backend_requirement(
+    {
+        "cudnn": _cudnn_bmm_fp8_requirement,
+        "cublas": _cublas_bmm_fp8_requirement,
+        "cutlass": _cutlass_bmm_fp8_requirement,
+        "auto": _cublas_bmm_fp8_requirement,  # cublas default
+    },
+    common_check=_check_bmm_fp8_problem_size,
+)
 def bmm_fp8(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -2073,7 +2131,6 @@ def bmm_fp8(
     >>> out.dtype
     torch.bfloat16
     """
-    _validate_fp8_output_dtype(dtype)
 
     if out is None:
         out = torch.empty(
@@ -2091,8 +2148,6 @@ def bmm_fp8(
     elif backend == "cublas":
         backends = ["cublas"]
     elif backend == "cutlass":
-        if A.dtype == torch.float8_e5m2 or B.dtype == torch.float8_e5m2:
-            raise ValueError("e5m2 is not supported for cutlass backend")
         backends = ["cutlass"]
     elif backend == "auto":
         backends = ["cutlass", "cublas", "cudnn"]
