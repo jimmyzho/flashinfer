@@ -170,10 +170,10 @@ struct Compute {
   // Note: skip_softmax early-return in FA3 !IS_FIRST_COL path drains BMM2[N-1] but leaves
   // frag_p_cross unfilled; subsequent post-loop BMM2 would use stale data. This is safe only when
   // skip_softmax is disabled (threshold=0, ENABLE_SKIP_SOFTMAX=false), which is the common case.
-  enum {
-    FA3_DEFERRED_BMM2 = (Kernel_traits::ELEMENT_BYTES == 2 &&
-                         Kernel_traits::SAGE_BLOCK_SIZE_V == 0 && !Kernel_traits::PAGED_KV_INPUT)
-  };
+  // Disabled: prefill tests showed correctness issues in the FA3 deferred BMM2 path with softcap
+  // and skip_softmax. Direct-acc softmax (USE_DIRECT_ACC) and skip-softmax barrier gating
+  // (ENABLE_SKIP_SOFTMAX wrappers) from the same parent commit remain active.
+  enum { FA3_DEFERRED_BMM2 = 0 };
 
 #define K_TILE_WAIT()         \
   int ready_k = cbr_k.peek(); \
