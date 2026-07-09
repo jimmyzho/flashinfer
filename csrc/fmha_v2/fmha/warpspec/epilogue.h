@@ -278,6 +278,7 @@ struct Softmax_base {
     // The FP8 specialization (Softmax<Hopper_qgmma_e4m3_fp32_traits>) uses a 4-way
     // split-accumulator reduction to expose ILP, but the 16-bit softmax is already hidden behind
     // the other warpgroup's HGMMA, so there is no latency to recover
+#pragma unroll
     for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++) {
       local_max_[mi] = elt_[mi][0];
 #pragma unroll
