@@ -274,17 +274,30 @@ struct Softmax_base {
     constexpr bool may_skip = Kernel_traits::ENABLE_SKIP_SOFTMAX && !IS_FIRST_COL;
     bool skip = may_skip;
 
-// Row-wise max of current tile: 4-way tree reduction splits the single-accumulator serial
-// dependency chain into 4 independent chains, so the pipeline can issue other chains'
-// instructions while waiting for one chain's FMNMX result.
+    // FP8 only: 4-way tree reduction splits the single-accumulator serial dependency chain
+    // into 4 independent chains, so the pipeline can issue other chains' instructions while
+    // waiting for one chain's FMNMX result. FP16/BF16 keeps the original serial reduction
+    // (the tree variant measured ~2% slower there on H200).
+    constexpr bool USE_TREE_MAX =
+        std::is_same<typename Kernel_traits::Element_data_type, fmha::e4m3_t>::value ||
+        std::is_same<typename Kernel_traits::Element_data_type, fmha::e5m2_t>::value;
+
 #pragma unroll
     for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++) {
-      float pmax[4] = {elt_[mi][0], elt_[mi][1], elt_[mi][2], elt_[mi][3]};
+      if constexpr (USE_TREE_MAX) {
+        float pmax[4] = {elt_[mi][0], elt_[mi][1], elt_[mi][2], elt_[mi][3]};
 #pragma unroll
-      for (int ni = 4; ni < Mma_tile_p::CORES_N * 2; ni++) {
-        pmax[ni & 3] = fmaxf(pmax[ni & 3], elt_[mi][ni]);
+        for (int ni = 4; ni < Mma_tile_p::CORES_N * 2; ni++) {
+          pmax[ni & 3] = fmaxf(pmax[ni & 3], elt_[mi][ni]);
+        }
+        local_max_[mi] = fmaxf(fmaxf(pmax[0], pmax[1]), fmaxf(pmax[2], pmax[3]));
+      } else {
+        local_max_[mi] = elt_[mi][0];
+#pragma unroll
+        for (int ni = 1; ni < Mma_tile_p::CORES_N * 2; ni++) {
+          local_max_[mi] = fmaxf(local_max_[mi], elt_[mi][ni]);
+        }
       }
-      local_max_[mi] = fmaxf(fmaxf(pmax[0], pmax[1]), fmaxf(pmax[2], pmax[3]));
       local_max_[mi] = fmaxf(__shfl_xor_sync(uint32_t(-1), local_max_[mi], 1), local_max_[mi]);
       local_max_[mi] = fmaxf(__shfl_xor_sync(uint32_t(-1), local_max_[mi], 2), local_max_[mi]);
 
