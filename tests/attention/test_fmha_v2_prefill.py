@@ -1,7 +1,10 @@
+import itertools
+import math
+import os
+from typing import Optional, Tuple, Union
+
 import pytest
 import torch
-import math
-from typing import Optional, Tuple, Union
 
 import flashinfer
 
@@ -32,6 +35,65 @@ def _get_workspace_buffer() -> torch.Tensor:
     else:
         _workspace_buffer.zero_()
     return _workspace_buffer
+
+
+@pytest.fixture(scope="session", autouse=True)
+def prebuild_fmha_v2_modules():
+    """Batch-compile every FMHAv2 module the test matrix needs before the
+    first test runs.
+
+    All specs go into one merged ninja graph (``build_jit_specs``), so the
+    per-config modules compile in parallel across the whole machine instead
+    of one serial JIT build whenever a test first hits a new
+    (layout, dtype, head_dim, softcap) combination. Modules already in the
+    JIT cache are no-ops for ninja. Set ``FMHA_V2_TEST_PREBUILD=0`` to skip
+    (e.g. when running a single test on a cold cache).
+    """
+    if os.environ.get("FMHA_V2_TEST_PREBUILD", "1") == "0":
+        return
+    if not torch.cuda.is_available():
+        return
+    device = torch.device("cuda")
+    if not (is_sm90a_supported(device) or is_sm12x_supported(device)):
+        return
+    from flashinfer.jit import build_jit_specs, gen_fmha_v2_module
+
+    is_sm12x = is_sm12x_supported(device)
+    fp8 = torch.float8_e4m3fn
+    # (dtype, o_dtype) pairs and layouts mirror the parametrize stacks of
+    # test_trtllm_fmha_v2_prefill / test_fmha_v2_prefill_wrapper.
+    dtype_pairs = [
+        (torch.float16, torch.float16),
+        (torch.bfloat16, torch.bfloat16),
+        (fp8, fp8),
+        (fp8, torch.bfloat16),
+        (fp8, torch.float16),
+    ]
+    # Q_PAGED_KV_HND shares its module URI with NHD, so one paged entry
+    # suffices (the name-dedupe below would drop it anyway).
+    layouts = ["PACKED_QKV", "CONTIGUOUS_Q_KV", "SEPARATE_Q_K_V", "Q_PAGED_KV_NHD"]
+    specs = []
+    seen = set()
+    for layout, (dtype, o_dtype), head_dim, soft_cap in itertools.product(
+        layouts, dtype_pairs, [128, 256], [False, True]
+    ):
+        # Mirror run_trtllm_fmha_v2_prefill_case's skip rules so only modules
+        # a test will actually load get built.
+        if dtype == fp8 and is_sm12x:
+            continue
+        if layout == "SEPARATE_Q_K_V" and (dtype == fp8 or is_sm12x or soft_cap):
+            continue
+        spec = gen_fmha_v2_module(
+            layout,
+            dtype,
+            o_dtype if dtype == fp8 else None,
+            head_dim,
+            use_logits_soft_cap=soft_cap,
+        )
+        if spec.name not in seen:
+            seen.add(spec.name)
+            specs.append(spec)
+    build_jit_specs(specs, verbose=False)
 
 
 def attention_mla_ref_torch(
@@ -748,6 +810,7 @@ def run_trtllm_fmha_v2_prefill_case(
                 logits_soft_cap=soft_cap,
                 q_data_type=dtype,
                 o_data_type=o_dtype,
+                head_dim=head_dim,
             )
             result = wrapper.run(
                 q, paged_kv_cache, out=o, return_lse=save_softmax_stats
@@ -768,6 +831,7 @@ def run_trtllm_fmha_v2_prefill_case(
                 logits_soft_cap=soft_cap,
                 q_data_type=dtype,
                 o_data_type=o_dtype,
+                head_dim=head_dim,
             )
             if input_layout == "PACKED_QKV":
                 result = wrapper.run(packed_qkv, out=o, return_lse=save_softmax_stats)
@@ -1650,7 +1714,7 @@ def test_batch_prefill_paged_trtllm_fmhav2_wrapper(
     wrapper = FmhaV2BatchPrefillWithPagedKVCacheWrapper(
         _get_workspace_buffer(), kv_layout=kv_layout
     )
-    wrapper.plan(*plan_args, causal=causal, q_data_type=dtype)
+    wrapper.plan(*plan_args, causal=causal, q_data_type=dtype, head_dim=head_dim)
     out = wrapper.run(q, paged_kv_cache)
 
     torch.testing.assert_close(out.float(), out_ref, rtol=1e-2, atol=1e-2)
@@ -1691,7 +1755,7 @@ def test_batch_prefill_paged_trtllm_fmhav2_plan_reuse(
     wrapper = FmhaV2BatchPrefillWithPagedKVCacheWrapper(
         _get_workspace_buffer(), kv_layout=kv_layout
     )
-    wrapper.plan(*plan_args, causal=causal, q_data_type=dtype)
+    wrapper.plan(*plan_args, causal=causal, q_data_type=dtype, head_dim=128)
 
     for run_idx in range(num_runs):
         out = wrapper.run(q, paged_kv_cache)

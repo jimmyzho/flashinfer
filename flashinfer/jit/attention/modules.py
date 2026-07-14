@@ -2055,6 +2055,12 @@ def gen_fmha_v2_module(
     input_layout: str,
     input_dtype: torch.dtype,
     output_dtype: Optional[torch.dtype] = None,
+    head_dim: Optional[int] = None,
+    *,
+    use_alibi: bool = False,
+    use_logits_soft_cap: bool = False,
+    enable_skip_softmax: bool = False,
+    enable_custom_mask: bool = False,
 ) -> JitSpec:
     # Setup generated source directory
     if output_dtype is None:
@@ -2068,7 +2074,29 @@ def gen_fmha_v2_module(
     input_dtype_str = dtype_map[input_dtype]
     output_dtype_str = dtype_map[output_dtype] if output_dtype is not None else None
 
-    uri = f"trtllm_fmha_v2_{input_layout.lower()}_{input_dtype_str}_{output_dtype_str}"
+    # NHD/HND paged layouts compile identical kernel sets (both map to
+    # InputLayout.Q_PAGED_KV in codegen); the layout string passed to the run
+    # FFI resolves the stride order per call (is_paged_hnd in fmha_v2_run.cu),
+    # so both share one module URI.
+    layout_key = input_layout.lower()
+    if layout_key in ("q_paged_kv_nhd", "q_paged_kv_hnd"):
+        layout_key = "q_paged_kv"
+
+    uri = f"trtllm_fmha_v2_{layout_key}_{input_dtype_str}_{output_dtype_str}"
+    # head_dim=None keeps the full kernel enumeration under the legacy URI
+    # (the AOT-friendly fat module). A concrete head_dim narrows codegen to
+    # the single requested configuration, fa2/fa3-style, so the URI must
+    # carry every narrowing key. return_softmax is not a key: both variants
+    # are always generated because the wrappers only learn return_lse at
+    # run() time.
+    if head_dim is not None:
+        uri += (
+            f"_hd{head_dim}_alibi{int(use_alibi)}"
+            f"_softcap{int(use_logits_soft_cap)}"
+            f"_skipsm{int(enable_skip_softmax)}"
+        )
+    if enable_custom_mask:
+        uri += "_cmask"
 
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     gen_directory.mkdir(parents=True, exist_ok=True)
@@ -2084,6 +2112,11 @@ def gen_fmha_v2_module(
         input_dtype_str,
         output_dtype_str,
         compilation_context=current_compilation_context,
+        head_dim=head_dim,
+        use_alibi=use_alibi if head_dim is not None else None,
+        use_logits_soft_cap=use_logits_soft_cap if head_dim is not None else None,
+        enable_skip_softmax=enable_skip_softmax if head_dim is not None else None,
+        enable_custom_mask=enable_custom_mask,
     )
 
     # Copy the static launcher/binding sources so one loaded module exposes
