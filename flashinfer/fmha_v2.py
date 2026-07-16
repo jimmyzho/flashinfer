@@ -42,10 +42,24 @@ def get_trtllm_fmha_v2_module(
     input_layout: str,
     input_dtype: torch.dtype,
     output_dtype: Optional[torch.dtype] = None,
+    head_dim: Optional[int] = None,
+    use_alibi: bool = False,
+    use_logits_soft_cap: bool = False,
+    enable_skip_softmax: bool = False,
 ):
     # Layout/dtype-specialised FMHAv2 module exposing prepare(), prepare_paged()
-    # and run().
-    return gen_fmha_v2_module(input_layout, input_dtype, output_dtype).build_and_load()
+    # and run(). A concrete head_dim narrows JIT codegen to that single
+    # configuration (head_dim + alibi/softcap/skip-softmax become part of the
+    # module URI); head_dim=None builds the full legacy kernel matrix.
+    return gen_fmha_v2_module(
+        input_layout,
+        input_dtype,
+        output_dtype,
+        head_dim,
+        use_alibi=use_alibi,
+        use_logits_soft_cap=use_logits_soft_cap,
+        enable_skip_softmax=enable_skip_softmax,
+    ).build_and_load()
 
 
 class _FmhaV2PrefillWrapperBase:
@@ -81,6 +95,7 @@ class _FmhaV2PrefillWrapperBase:
         self._scale_bmm2_d: Optional[torch.Tensor] = None
         # Per-plan state consumed by _run_impl(); set by the subclass plan().
         self._input_layout: str = ""
+        self._head_dim: Optional[int] = None
         self._causal: bool = False
         self._window_left: int = -1
         self._has_alibi: bool = False
@@ -215,6 +230,14 @@ class _FmhaV2PrefillWrapperBase:
         assert self._module is not None and self._input_layout, (
             "plan() must be called before run()"
         )
+        if self._head_dim is not None and q.shape[-1] != self._head_dim:
+            # The module was JIT-specialized for the planned head_dim; a
+            # mismatch would hit the C++ dispatcher's unsupported-config
+            # assert, so fail with a readable Python error instead.
+            raise ValueError(
+                f"q head_dim {q.shape[-1]} does not match plan(head_dim="
+                f"{self._head_dim}); re-plan with the matching head_dim."
+            )
         if self._input_layout == "PACKED_QKV":
             if q.dim() != 4 or q.shape[1] != 3:
                 raise ValueError(
@@ -336,6 +359,11 @@ class FmhaV2BatchPrefillWithPagedKVCacheWrapper(_FmhaV2PrefillWrapperBase):
 
     Restrictions: no in-kernel RoPE (pre-apply to Q/K; ``pos_encoding_mode``
     must be NONE or ALIBI).
+
+    Passing ``head_dim`` to plan() narrows JIT codegen to that single
+    configuration (~2 kernel sources instead of the full ~130-file matrix),
+    dramatically reducing first-use compile time; run() then validates the
+    q tensor against it. ``head_dim=None`` builds the full fat module.
     """
 
     def __init__(
@@ -366,6 +394,7 @@ class FmhaV2BatchPrefillWithPagedKVCacheWrapper(_FmhaV2PrefillWrapperBase):
         logits_soft_cap: Optional[float] = None,
         q_data_type: Union[str, torch.dtype] = "float16",
         o_data_type: Optional[Union[str, torch.dtype]] = None,
+        head_dim: Optional[int] = None,
     ) -> None:
         q_data_type = self._resolve_dtypes(q_data_type, o_data_type)
         self._check_gates(pos_encoding_mode, q_data_type, causal, window_left)
@@ -399,8 +428,12 @@ class FmhaV2BatchPrefillWithPagedKVCacheWrapper(_FmhaV2PrefillWrapperBase):
             input_layout,
             q_data_type,
             self._o_dtype if q_data_type == torch.float8_e4m3fn else None,
+            head_dim,
+            use_alibi=(pos_encoding_mode == "ALIBI"),
+            use_logits_soft_cap=bool(logits_soft_cap),
         )
         self._input_layout = input_layout
+        self._head_dim = head_dim
         self._causal = causal
         self._window_left = window_left
         self._kv_lens = self._kv_lens_buffer[:batch_size]
@@ -465,6 +498,11 @@ class FmhaV2BatchPrefillWithRaggedKVCacheWrapper(_FmhaV2PrefillWrapperBase):
     the codegen module and the run()-time tensor slots (see :meth:`run`):
     ``SEPARATE_Q_K_V`` (default), ``PACKED_QKV``, ``CONTIGUOUS_Q_KV`` — the
     same strings :func:`flashinfer.prefill.trtllm_fmha_v2_prefill` takes.
+
+    Passing ``head_dim`` to plan() narrows JIT codegen to that single
+    configuration (~2 kernel sources instead of the full ~130-file matrix),
+    dramatically reducing first-use compile time; run() then validates the
+    q tensor against it. ``head_dim=None`` builds the full fat module.
     """
 
     def plan(
@@ -483,6 +521,7 @@ class FmhaV2BatchPrefillWithRaggedKVCacheWrapper(_FmhaV2PrefillWrapperBase):
         logits_soft_cap: Optional[float] = None,
         q_data_type: Union[str, torch.dtype] = "float16",
         o_data_type: Optional[Union[str, torch.dtype]] = None,
+        head_dim: Optional[int] = None,
     ) -> None:
         if input_layout not in ("SEPARATE_Q_K_V", "PACKED_QKV", "CONTIGUOUS_Q_KV"):
             raise ValueError(
@@ -509,8 +548,12 @@ class FmhaV2BatchPrefillWithRaggedKVCacheWrapper(_FmhaV2PrefillWrapperBase):
             input_layout,
             q_data_type,
             self._o_dtype if q_data_type == torch.float8_e4m3fn else None,
+            head_dim,
+            use_alibi=(pos_encoding_mode == "ALIBI"),
+            use_logits_soft_cap=bool(logits_soft_cap),
         )
         self._input_layout = input_layout
+        self._head_dim = head_dim
         self._causal = causal
         self._window_left = window_left
         # run() passes seq_lens_kv to the FFI as the kernel's kv_lens tensor.

@@ -259,7 +259,7 @@ void {{ sliding_or_chunked_causal_kernel_name }}(
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-{% if custom_mask %} // custom_mask
+{% if custom_mask == "1" %} // custom_mask
 
 using Shared_custom_mask = typename Ktraits_custom_mask::Shared;
 
@@ -386,7 +386,7 @@ void {{ launcher_name }}(
             <<<block_size, Ktraits::THREADS, SMEM_BYTES, stream>>>({{ params_str }});
 {% endif %} // sliding_or_chunked_causal_mask
     } else if( launch_params.attention_mask_type == Attention_mask_type::CUSTOM_MASK ) {
-{% if custom_mask %} // custom_mask
+{% if custom_mask == "1" %} // custom_mask
         FMHA_CHECK_CUDA(cudaFuncSetAttribute({{ custom_mask_kernel_name }},
                                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                                          SMEM_BYTES));

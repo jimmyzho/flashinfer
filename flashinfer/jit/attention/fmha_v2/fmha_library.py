@@ -472,7 +472,12 @@ def is_kernel_spec_valid(kspec: FMHAv2KernelSpec) -> bool:
     )
 
 
-def get_kernel_code(kspec: FMHAv2KernelSpec, kname: str, lname: str) -> Optional[str]:
+def get_kernel_code(
+    kspec: FMHAv2KernelSpec,
+    kname: str,
+    lname: str,
+    enable_custom_mask: bool = False,
+) -> Optional[str]:
     min_cuda_version = 0  # no restriction
 
     # The architecture that determines the instruction.
@@ -571,14 +576,22 @@ def get_kernel_code(kspec: FMHAv2KernelSpec, kname: str, lname: str) -> Optional
     padding_mask, causal_mask, sliding_or_chunked_causal_mask, custom_mask = (
         selected_mask_types(kspec)
     )
+    # No JIT caller can supply the packed custom-mask tensor (neither the
+    # wrappers nor trtllm_fmha_v2_prefill plumb it), so skip that
+    # instantiation by default; the cubin-export path (GENERATE_CUBIN) uses
+    # its own selected_mask_types and is unaffected.
+    if not enable_custom_mask:
+        custom_mask = "0"
 
-    if any(
-        selected_mask_flag == "1" for selected_mask_flag in selected_mask_types(kspec)
-    ):
-        padding_mask, causal_mask, sliding_or_chunked_causal_mask, custom_mask = (
-            selected_mask_types(kspec)
+    if not any(
+        flag == "1"
+        for flag in (
+            padding_mask,
+            causal_mask,
+            sliding_or_chunked_causal_mask,
+            custom_mask,
         )
-    else:
+    ):
         return None
 
     kernel_flags = "0x{:02x}u".format(flags)
@@ -1246,12 +1259,29 @@ def generate_jit_sources(
     input_dtype: str,
     output_dtype: Optional[str],
     compilation_context: CompilationContext,
+    *,
+    head_dim: Optional[int] = None,
+    use_alibi: Optional[bool] = None,
+    use_logits_soft_cap: Optional[bool] = None,
+    enable_skip_softmax: Optional[bool] = None,
+    enable_custom_mask: bool = False,
 ) -> list[pathlib.Path]:
+    """Generate the kernel sources + dispatcher header for one JIT module.
+
+    The keyword filters narrow the enumerated kernel matrix to what the
+    caller will actually dispatch (fa2/fa3-style specialization): ``None``
+    keeps the full axis, a value pins it. ``head_dim=None`` keeps the full
+    head-size list (the fat AOT-friendly module). ``return_softmax`` is
+    deliberately never narrowed: the wrappers only learn ``return_lse`` at
+    run() time, and keeping both variants lets the legacy free function and
+    the wrappers share one module per configuration.
+    """
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     source_paths = []
     specs_names = []
     head_size_qk_values = [16, 32, 64, 128, 256, 512]
     head_size_qk_warpspec_values = [32, 40, 48, 64, 80, 96, 104, 128, 160, 192, 256]
+    head_size_qk_sm120_values = [64, 128, 256, 512]
 
     # 0 means head_size_v = head_size_qk (required for flash_valid)
     head_size_v_values = [0]
@@ -1269,14 +1299,37 @@ def generate_jit_sources(
 
     is_mla_values = [False]
 
-    enable_attn_logit_softcapping_values = [True, False]
+    enable_attn_logit_softcapping_values = (
+        [True, False] if use_logits_soft_cap is None else [use_logits_soft_cap]
+    )
     return_softmax_values = [True, False]
-    alibi_values = [True, False]
+    alibi_values = [True, False] if use_alibi is None else [use_alibi]
+    skip_softmax_values = (
+        [False, True] if enable_skip_softmax is None else [enable_skip_softmax]
+    )
     target_major_archs = {
         major for major, _minor in compilation_context.TARGET_CUDA_ARCHS
     }
     include_sm90_kernels = 9 in target_major_archs
     include_sm120_kernels = 12 in target_major_archs
+
+    if head_dim is not None:
+        supported_head_dims = (
+            set(head_size_qk_warpspec_values) if include_sm90_kernels else set()
+        ) | (set(head_size_qk_sm120_values) if include_sm120_kernels else set())
+        if head_dim not in supported_head_dims:
+            raise ValueError(
+                f"FMHAv2 head_dim {head_dim} is not supported for target CUDA archs "
+                f"{sorted(compilation_context.TARGET_CUDA_ARCHS)}; "
+                f"supported head dims: {sorted(supported_head_dims)}"
+            )
+        head_size_qk_warpspec_values = [
+            h for h in head_size_qk_warpspec_values if h == head_dim
+        ]
+        head_size_qk_sm120_values = [
+            h for h in head_size_qk_sm120_values if h == head_dim
+        ]
+
     warp_spec_configs: itertools.product = itertools.product(
         [90] if include_sm90_kernels else [],
         dtype_values,
@@ -1284,14 +1337,13 @@ def generate_jit_sources(
         head_size_v_values,
         enable_attn_logit_softcapping_values,
         return_softmax_values,
-        [False, True],  # enable_skip_softmax
+        skip_softmax_values,
         alibi_values,
         is_mla_values,
         input_layout_values,
         output_dtype_values,
     )
 
-    head_size_qk_sm120_values = [64, 128, 256, 512]
     sm120_configs: itertools.product = itertools.product(
         [120] if include_sm120_kernels else [],
         dtype_values,  # fallback to avoid empty product
@@ -1357,7 +1409,9 @@ def generate_jit_sources(
                 continue
 
             fname, lname, kname = encode_name(kspec)
-            kernel_code = get_kernel_code(kspec, kname, lname)
+            kernel_code = get_kernel_code(
+                kspec, kname, lname, enable_custom_mask=enable_custom_mask
+            )
             if kernel_code is None:
                 continue
 
@@ -1366,6 +1420,17 @@ def generate_jit_sources(
             write_if_different(kernel_path, kernel_code)
             source_paths.append(kernel_path)
             specs_names.append((kspec, fname, lname, kname))
+
+    if not specs_names:
+        raise ValueError(
+            f"FMHAv2 codegen produced no kernels for uri={uri!r}: "
+            f"layout={input_layout}, dtype={input_dtype}, "
+            f"output_dtype={output_dtype}, head_dim={head_dim}, "
+            f"use_alibi={use_alibi}, use_logits_soft_cap={use_logits_soft_cap}, "
+            f"enable_skip_softmax={enable_skip_softmax}, target archs "
+            f"{sorted(compilation_context.TARGET_CUDA_ARCHS)}. The requested "
+            "combination is not supported by any FMHAv2 kernel."
+        )
 
     api_code = get_api_code(specs_names)
     api_path = gen_directory / "fmha_v2_api.h"
